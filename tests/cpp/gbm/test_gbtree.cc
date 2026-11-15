@@ -6,12 +6,25 @@
 #include <xgboost/host_device_vector.h>  // for HostDeviceVector
 #include <xgboost/json.h>                // for Json, Object
 #include <xgboost/learner.h>             // for Learner
+#include <xgboost/logging.h>             // for ConsoleLogger
+#include <xgboost/tree_updater.h>        // for TreeUpdater, XGBOOST_REGISTER_TREE_UPDATER
 
 #include <algorithm>  // for fill
+#include <cstdint>    // for int32_t, uint32_t
 #include <limits>     // for numeric_limits
 #include <memory>     // for shared_ptr
 #include <optional>   // for optional
-#include <string>     // for string
+#include <set>        // for set
+#include <string>     // for string, to_string
+#include <thread>     // for this_thread
+#include <tuple>      // for ignore
+#include <utility>    // for pair
+#include <vector>     // for vector
+
+#if !defined(_WIN32)
+#include <sys/wait.h>  // for waitpid, WIFEXITED
+#include <unistd.h>    // for fork, alarm, _exit
+#endif                 // !defined(_WIN32)
 
 #include "../../../src/data/proxy_dmatrix.h"  // for DMatrixProxy
 #include "../../../src/gbm/gbtree.h"
@@ -846,4 +859,458 @@ TEST(GBTree, InplacePredictionError) {
   }
 #endif  // defined(XGBOOST_USE_CUDA)
 }
+
+namespace {
+bst_idx_t constexpr kTargetRows = 512;
+bst_feature_t constexpr kTargetCols = 8;
+bst_target_t constexpr kTargets = 3;
+
+// Whether BoostTargets can build the targets at the same time with n_threads threads.
+bool ConcurrentTargets(std::int32_t n_threads) {
+#if defined(XGBOOST_USE_THREADPOOL)
+  return false;
+#else
+  return AllThreadsForTest() >= n_threads;
+#endif  // defined(XGBOOST_USE_THREADPOOL)
+}
+
+struct TargetTreesResult {
+  std::string model;
+  std::vector<std::int32_t> worker_threads;
+};
+
+// Boosts kTargets scalar-leaf targets for four iterations directly on a GBTree. With deep, the
+// last two iterations run from a deeper stack frame filled with garbage.
+TargetTreesResult TrainTargets(std::shared_ptr<DMatrix> p_fmat, std::int32_t n_threads,
+                               bool parallel, Args const& extra = {}, std::uint32_t seed = 0,
+                               bool deep = false);
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#else
+__attribute__((noinline))
+#endif
+void DoBoostFromDeeperFrame(gbm::GBTree* gbtree, std::shared_ptr<DMatrix> p_fmat,
+                            GradientContainer* gpair) {
+  std::size_t constexpr kBytes = 1 << 16;
+  char volatile garbage[kBytes];  // NOLINT
+  for (std::size_t i = 0; i < kBytes; ++i) {
+    garbage[i] = static_cast<char>(0xFF);
+  }
+  gbtree->DoBoost(p_fmat, gpair, nullptr);
+  garbage[0] = garbage[1];
+}
+
+std::string DumpModel(gbm::GBTree const& gbtree) {
+  Json model{Object{}};
+  gbtree.SaveModel(&model);
+  std::string str;
+  Json::Dump(model, &str);
+  return str;
+}
+
+TargetTreesResult TrainTargets(std::shared_ptr<DMatrix> p_fmat, std::int32_t n_threads,
+                               bool parallel, Args const& extra, std::uint32_t seed, bool deep) {
+  Context ctx;
+  ctx.UpdateAllowUnknown(Args{{"nthread", std::to_string(n_threads)}});
+  ctx.Rng().seed(seed);
+  LearnerModelState mparam{MakeMP(kTargetCols, .5, kTargets)};
+  std::unique_ptr<GradientBooster> p_gbm{GradientBooster::Create("gbtree", &ctx, &mparam)};
+  auto& gbtree = dynamic_cast<gbm::GBTree&>(*p_gbm);
+  Args args{{"tree_method", "hist"}, {"parallel_target_trees", parallel ? "true" : "false"}};
+  args.insert(args.end(), extra.cbegin(), extra.cend());
+  gbtree.Configure(args);
+  auto gpair = GenerateRandomGradients(&ctx, kTargetRows, kTargets);
+  for (std::int32_t i = 0; i < 4; ++i) {
+    if (deep && i >= 2) {
+      DoBoostFromDeeperFrame(&gbtree, p_fmat, &gpair);
+    } else {
+      gbtree.DoBoost(p_fmat, &gpair, nullptr);
+    }
+  }
+  return {DumpModel(gbtree), gbtree.TargetWorkerThreadsForTest()};
+}
+
+// The trees of one target, in the order they were built.
+std::vector<std::string> TargetTrees(std::string const& model, bst_target_t gid) {
+  auto jmodel = Json::Load(StringView{model});
+  auto const& trees = get<Array const>(jmodel["model"]["trees"]);
+  auto const& tree_info = get<Array const>(jmodel["model"]["tree_info"]);
+  std::vector<std::string> out;
+  for (std::size_t i = 0; i < trees.size(); ++i) {
+    if (get<Integer const>(tree_info[i]) == static_cast<Integer::Int>(gid)) {
+      std::string str;
+      Json::Dump(trees[i], &str);
+      out.push_back(str);
+    }
+  }
+  return out;
+}
+
+std::shared_ptr<DMatrix> TargetQuantileDMatrix() {
+  return RandomDataGenerator{kTargetRows, kTargetCols, 0.2}.Bins(256).GenerateQuantileDMatrix(
+      false);
+}
+
+// Runs fn and returns what it logs at the warning level.
+template <typename Fn>
+std::string CaptureWarnings(Fn&& fn) {
+  auto const verbosity = static_cast<std::int32_t>(ConsoleLogger::GlobalVerbosity());
+  ConsoleLogger::Configure({{"verbosity", "1"}});
+  testing::internal::CaptureStderr();
+  try {
+    fn();
+  } catch (...) {
+    std::ignore = testing::internal::GetCapturedStderr();
+    ConsoleLogger::Configure({{"verbosity", std::to_string(verbosity)}});
+    throw;
+  }
+  auto output = testing::internal::GetCapturedStderr();
+  ConsoleLogger::Configure({{"verbosity", std::to_string(verbosity)}});
+  return output;
+}
+
+std::size_t CountOf(std::string const& haystack, std::string const& needle) {
+  std::size_t n{0};
+  for (auto pos = haystack.find(needle); pos != std::string::npos;
+       pos = haystack.find(needle, pos + 1)) {
+    ++n;
+  }
+  return n;
+}
+
+char const kFallback[] = "`parallel_target_trees` builds the targets one after another";
+
+// Builds no trees, and throws when it runs on a thread other than the one that created it, so
+// only the workers on the pool's threads throw.
+std::thread::id test_updater_thread;
+class ThrowOffCallingThread : public TreeUpdater {
+ public:
+  explicit ThrowOffCallingThread(Context const* ctx) : TreeUpdater{ctx} {}
+  std::set<std::string> Configure(Args const&) override { return {}; }
+  void LoadConfig(Json const&) override {}
+  void SaveConfig(Json*) const override {}
+  [[nodiscard]] char const* Name() const override { return "test_throw_off_calling_thread"; }
+  [[nodiscard]] bool PrepareConcurrentBuild(tree::TrainParam const*, DMatrix*) override {
+    return true;
+  }
+  void Update(tree::TrainParam const*, GradientContainer*, DMatrix*,
+              common::Span<HostDeviceVector<bst_node_t>>, std::vector<RegTree*> const&) override {
+    if (std::this_thread::get_id() != test_updater_thread) {
+      LOG(FATAL) << "Thrown off the calling thread.";
+    }
+  }
+};
+
+XGBOOST_REGISTER_TREE_UPDATER(ThrowOffCallingThread, "test_throw_off_calling_thread")
+    .describe("Test-only updater that throws on the threads of BoostTargets' pool.")
+    .set_body([](Context const* ctx, ObjInfo const*) { return new ThrowOffCallingThread{ctx}; });
+}  // namespace
+
+TEST(GBTree, ParallelTargetTrees) {
+  if (!ConcurrentTargets(3)) {
+    GTEST_SKIP() << "Requires three threads and an OpenMP build.";
+  }
+  // With one thread per worker the trees match a serial build: a DMatrix gets its gradient
+  // index before the first concurrent build, a QuantileDMatrix has it from the start.
+  std::vector<std::int32_t> const kThree{1, 1, 1};
+  for (auto const& p_fmat : {RandomDataGenerator{kTargetRows, kTargetCols, 0.2}.GenerateDMatrix(),
+                             TargetQuantileDMatrix()}) {
+    auto expected = TrainTargets(p_fmat, 1, false);
+    ASSERT_TRUE(expected.worker_threads.empty());
+    // Three threads give each target a worker; two make the first worker build two targets.
+    for (auto const& [n_threads, worker_threads] :
+         {std::pair{3, std::vector<std::int32_t>{1, 1, 1}},
+          std::pair{2, std::vector<std::int32_t>{1, 1}}}) {
+      auto result = TrainTargets(p_fmat, n_threads, true);
+      ASSERT_EQ(result.worker_threads, worker_threads);
+      ASSERT_EQ(result.model, expected.model);
+    }
+    // Two trees per target and iteration.
+    Args forest{{"num_parallel_tree", "2"}};
+    auto forest_result = TrainTargets(p_fmat, 3, true, forest);
+    ASSERT_EQ(forest_result.worker_threads, kThree);
+    ASSERT_EQ(forest_result.model, TrainTargets(p_fmat, 1, false, forest).model);
+    // The updaters keep the training parameter's address across iterations.
+    auto deep = TrainTargets(p_fmat, 3, true, {}, 0, true);
+    ASSERT_EQ(deep.worker_threads, kThree);
+    ASSERT_EQ(deep.model, expected.model);
+  }
+}
+
+TEST(GBTree, ParallelTargetTreesUnevenThreads) {
+  if (!ConcurrentTargets(4)) {
+    GTEST_SKIP() << "Requires four threads and an OpenMP build.";
+  }
+  // With four threads the first worker has two. Each target's trees match a serial build with
+  // the same number of threads.
+  auto p_fmat = TargetQuantileDMatrix();
+  auto result = TrainTargets(p_fmat, 4, true);
+  ASSERT_EQ(result.worker_threads, (std::vector<std::int32_t>{2, 1, 1}));
+  auto two_threads = TrainTargets(p_fmat, 2, false).model;
+  auto one_thread = TrainTargets(p_fmat, 1, false).model;
+  ASSERT_EQ(TargetTrees(result.model, 0), TargetTrees(two_threads, 0));
+  for (bst_target_t gid = 1; gid < kTargets; ++gid) {
+    ASSERT_EQ(TargetTrees(result.model, gid), TargetTrees(one_thread, gid));
+  }
+}
+
+TEST(GBTree, ParallelTargetTreesSampling) {
+  if (!ConcurrentTargets(3)) {
+    GTEST_SKIP() << "Requires three threads and an OpenMP build.";
+  }
+  // Each target samples from its own seed, so the model doesn't depend on the number of
+  // workers, or on whether the targets are built at the same time at all (one thread).
+  auto p_fmat = TargetQuantileDMatrix();
+  Args sampling{{"subsample", "0.8"}, {"colsample_bynode", "0.5"}};
+  auto serial = TrainTargets(p_fmat, 1, true, sampling);
+  ASSERT_TRUE(serial.worker_threads.empty());
+  for (auto const& [n_threads, worker_threads] : {std::pair{3, std::vector<std::int32_t>{1, 1, 1}},
+                                                  std::pair{2, std::vector<std::int32_t>{1, 1}}}) {
+    auto result = TrainTargets(p_fmat, n_threads, true, sampling);
+    ASSERT_EQ(result.worker_threads, worker_threads);
+    ASSERT_EQ(result.model, serial.model);
+  }
+  // The seeds come from the booster's generator.
+  ASSERT_NE(TrainTargets(p_fmat, 3, true, sampling, 1).model, serial.model);
+}
+
+TEST(GBTree, ParallelTargetTreesWorkers) {
+  if (!ConcurrentTargets(4)) {
+    GTEST_SKIP() << "Requires four threads and an OpenMP build.";
+  }
+  // DoBoost updates the training prediction cache from each target's leaf positions.
+  Context ctx;
+  ctx.UpdateAllowUnknown(Args{{"nthread", "4"}});
+  LearnerModelState mparam{MakeMP(kTargetCols, .5, kTargets)};
+  std::unique_ptr<GradientBooster> p_gbm{GradientBooster::Create("gbtree", &ctx, &mparam)};
+  auto& gbtree = dynamic_cast<gbm::GBTree&>(*p_gbm);
+  Args args{{"tree_method", "hist"}, {"parallel_target_trees", "true"}};
+  gbtree.Configure(args);
+
+  auto p_fmat = RandomDataGenerator{kTargetRows, kTargetCols, 0.2}.GenerateDMatrix();
+  auto p_copy = RandomDataGenerator{kTargetRows, kTargetCols, 0.2}.GenerateDMatrix();
+  auto gpair = GenerateRandomGradients(&ctx, kTargetRows, kTargets);
+  std::int32_t version{0};
+  auto boost = [&] {
+    gbtree.DoBoost(p_fmat, &gpair, nullptr);
+    ++version;
+    auto const& cache = gbtree.PredictionCache(p_fmat.get());
+    ASSERT_EQ(cache.version, version);
+    HostDeviceVector<float> fresh;
+    gbtree.PredictBatch(p_copy, &fresh, false, 0, 0);
+    auto const& h_cached = cache.predictions.ConstHostVector();
+    auto const& h_fresh = fresh.ConstHostVector();
+    ASSERT_EQ(h_cached.size(), kTargetRows * kTargets);
+    ASSERT_EQ(h_cached.size(), h_fresh.size());
+    for (std::size_t i = 0; i < h_cached.size(); ++i) {
+      ASSERT_NEAR(h_cached[i], h_fresh[i], 1e-6);
+    }
+  };
+  for (std::int32_t i = 0; i < 2; ++i) {
+    boost();
+    ASSERT_EQ(gbtree.TargetWorkerThreadsForTest(), (std::vector<std::int32_t>{2, 1, 1}));
+  }
+  ASSERT_EQ(gbtree.TargetWorkerBuildsForTest(), 1);
+
+  // A different thread split rebuilds the workers, even with the same number of workers.
+  for (auto const& [n_threads, worker_threads] : {std::pair{3, std::vector<std::int32_t>{1, 1, 1}},
+                                                  std::pair{2, std::vector<std::int32_t>{1, 1}}}) {
+    ctx.UpdateAllowUnknown(Args{{"nthread", std::to_string(n_threads)}});
+    boost();
+    ASSERT_EQ(gbtree.TargetWorkerThreadsForTest(), worker_threads);
+  }
+  ASSERT_EQ(gbtree.TargetWorkerBuildsForTest(), 3);
+
+  // Configuring the same parameters again, as a learning rate schedule does every iteration,
+  // keeps the workers. A change to the updaters' configuration rebuilds them.
+  gbtree.Configure(args);
+  boost();
+  ASSERT_EQ(gbtree.TargetWorkerBuildsForTest(), 3);
+  gbtree.Configure(Args{{"max_cached_hist_node", "1024"}});
+  boost();
+  ASSERT_EQ(gbtree.TargetWorkerBuildsForTest(), 4);
+
+  // LoadConfig drops the workers, and the next iteration recreates them.
+  Json config{Object{}};
+  gbtree.SaveConfig(&config);
+  gbtree.LoadConfig(config);
+  ASSERT_TRUE(gbtree.TargetWorkerThreadsForTest().empty());
+  boost();
+  ASSERT_EQ(gbtree.TargetWorkerThreadsForTest(), (std::vector<std::int32_t>{1, 1}));
+  ASSERT_EQ(gbtree.TargetWorkerBuildsForTest(), 5);
+
+  // Building the targets one after another frees the workers.
+  ctx.UpdateAllowUnknown(Args{{"nthread", "1"}});
+  std::ignore = CaptureWarnings([&] { boost(); });
+  ASSERT_TRUE(gbtree.TargetWorkerThreadsForTest().empty());
+}
+
+TEST(GBTree, ParallelTargetTreesFallback) {
+  if (!ConcurrentTargets(3)) {
+    GTEST_SKIP() << "Requires three threads and an OpenMP build.";
+  }
+  // Unsupported setups build the targets one after another, each logging its own reason.
+  common::TemporaryDirectory tmpdir;
+  auto p_extmem =
+      RandomDataGenerator{kTargetRows, kTargetCols, 0.2}.Batches(2).GenerateSparsePageDMatrix(
+          (tmpdir.Path() / "cache").string(), true);
+  auto p_fmat = RandomDataGenerator{kTargetRows, kTargetCols, 0.2}.GenerateDMatrix();
+  auto check = [](auto train, std::string const& reason) {
+    TargetTreesResult result;
+    auto output = CaptureWarnings([&] { result = train(); });
+    ASSERT_TRUE(result.worker_threads.empty()) << reason;
+    ASSERT_EQ(CountOf(output, std::string(kFallback) + ": " + reason), 1) << output;
+  };
+  check([&] { return TrainTargets(p_extmem, 3, true); },
+        "the `grow_quantile_histmaker` updater doesn't support it with this data");
+  check([&] { return TrainTargets(p_fmat, 3, true, {{"tree_method", "approx"}}); },
+        "the `grow_histmaker` updater doesn't support it with this data");
+  check([&] { return TrainTargets(p_fmat, 1, true); }, "it needs more than one thread");
+}
+
+#if defined(XGBOOST_USE_THREADPOOL)
+TEST(GBTree, ParallelTargetTreesThreadPoolFallback) {
+  // The workers' loops would share the one global pool, so the targets are built one after
+  // another.
+  auto p_fmat = TargetQuantileDMatrix();
+  TargetTreesResult result;
+  auto output = CaptureWarnings([&] { result = TrainTargets(p_fmat, 3, true); });
+  ASSERT_TRUE(result.worker_threads.empty());
+  ASSERT_EQ(CountOf(output, std::string(kFallback) +
+                                ": this build runs parallel loops on one shared thread pool"),
+            1)
+      << output;
+}
+#endif  // defined(XGBOOST_USE_THREADPOOL)
+
+TEST(GBTree, ParallelTargetTreesFallbackWarning) {
+  if (!ConcurrentTargets(3)) {
+    GTEST_SKIP() << "Requires three threads and an OpenMP build.";
+  }
+  // The fallback warns once per reason, so a learning rate schedule, which configures the
+  // booster every iteration, doesn't repeat it.
+  Context ctx;
+  ctx.UpdateAllowUnknown(Args{{"nthread", "3"}});
+  LearnerModelState mparam{MakeMP(kTargetCols, .5, kTargets)};
+  std::unique_ptr<GradientBooster> p_gbm{GradientBooster::Create("gbtree", &ctx, &mparam)};
+  Args args{{"tree_method", "approx"}, {"parallel_target_trees", "true"}};
+  p_gbm->Configure(args);
+  auto p_fmat = RandomDataGenerator{kTargetRows, kTargetCols, 0.2}.GenerateDMatrix();
+  auto gpair = GenerateRandomGradients(&ctx, kTargetRows, kTargets);
+  auto n_warnings = [&](std::int32_t n_iters) {
+    auto output = CaptureWarnings([&] {
+      for (std::int32_t i = 0; i < n_iters; ++i) {
+        p_gbm->Configure(args);
+        p_gbm->DoBoost(p_fmat, &gpair, nullptr);
+      }
+    });
+    return CountOf(output, kFallback);
+  };
+  EXPECT_EQ(n_warnings(2), 1);
+  EXPECT_EQ(n_warnings(1), 0);
+  // A different reason is logged.
+  ctx.UpdateAllowUnknown(Args{{"nthread", "1"}});
+  EXPECT_EQ(n_warnings(1), 1);
+}
+
+TEST(GBTree, ParallelTargetTreesUpdateProcess) {
+  if (!ConcurrentTargets(3)) {
+    GTEST_SKIP() << "Requires three threads and an OpenMP build.";
+  }
+  // Updating existing trees builds the targets one after another, with the same result.
+  auto p_fmat = RandomDataGenerator{kTargetRows, kTargetCols, 0.2}.GenerateDMatrix();
+  auto refresh = [&](bool parallel) {
+    Context ctx;
+    ctx.UpdateAllowUnknown(Args{{"nthread", "3"}});
+    LearnerModelState mparam{MakeMP(kTargetCols, .5, kTargets)};
+    std::unique_ptr<GradientBooster> p_gbm{GradientBooster::Create("gbtree", &ctx, &mparam)};
+    auto& gbtree = dynamic_cast<gbm::GBTree&>(*p_gbm);
+    gbtree.Configure(Args{{"tree_method", "hist"}});
+    auto gpair = GenerateRandomGradients(&ctx, kTargetRows, kTargets);
+    for (std::int32_t i = 0; i < 2; ++i) {
+      gbtree.DoBoost(p_fmat, &gpair, nullptr);
+    }
+    gbtree.Configure(Args{{"process_type", "update"},
+                          {"updater", "refresh"},
+                          {"parallel_target_trees", parallel ? "true" : "false"}});
+    std::string output = CaptureWarnings([&] { gbtree.DoBoost(p_fmat, &gpair, nullptr); });
+    EXPECT_TRUE(gbtree.TargetWorkerThreadsForTest().empty());
+    if (parallel) {
+      EXPECT_EQ(
+          CountOf(output, std::string(kFallback) + ": it supports only `process_type=default`"), 1)
+          << output;
+    }
+    return DumpModel(gbtree);
+  };
+  ASSERT_EQ(refresh(true), refresh(false));
+}
+
+TEST(GBTree, ParallelTargetTreesError) {
+  if (!ConcurrentTargets(3)) {
+    GTEST_SKIP() << "Requires three threads and an OpenMP build.";
+  }
+  // An error in the updaters reaches the caller. More constraints than features fail in every
+  // worker.
+  auto p_fmat = TargetQuantileDMatrix();
+  ASSERT_THROW(TrainTargets(p_fmat, 3, true, {{"monotone_constraints", "(1,1,1,1,1,1,1,1,1)"}}),
+               dmlc::Error);
+  // An error only on the pool's threads reaches the caller too.
+  test_updater_thread = std::this_thread::get_id();
+  ASSERT_THROW(TrainTargets(p_fmat, 3, true, {{"updater", "test_throw_off_calling_thread"}}),
+               dmlc::Error);
+}
+
+#if !defined(_WIN32)
+TEST(GBTree, ParallelTargetTreesFork) {
+  if (!ConcurrentTargets(3)) {
+    GTEST_SKIP() << "Requires three threads and an OpenMP build.";
+  }
+  // A forked child has none of the pool's threads. Training, reloading the configuration and
+  // freeing the booster in the child must not wait for or join them.
+  Context ctx;
+  ctx.UpdateAllowUnknown(Args{{"nthread", "3"}});
+  LearnerModelState mparam{MakeMP(kTargetCols, .5, kTargets)};
+  std::unique_ptr<GradientBooster> p_gbm{GradientBooster::Create("gbtree", &ctx, &mparam)};
+  auto& gbtree = dynamic_cast<gbm::GBTree&>(*p_gbm);
+  gbtree.Configure(Args{{"tree_method", "hist"}, {"parallel_target_trees", "true"}});
+  auto p_fmat = TargetQuantileDMatrix();
+  auto gpair = GenerateRandomGradients(&ctx, kTargetRows, kTargets);
+  gbtree.DoBoost(p_fmat, &gpair, nullptr);
+  ASSERT_EQ(gbtree.TargetWorkerBuildsForTest(), 1);
+
+  std::vector<std::string> actions{"load_config", "free"};
+#if defined(__APPLE__)
+  // LLVM's OpenMP runtime supports parallel regions in a forked child; GNU's may not.
+  actions.emplace_back("boost");
+#endif  // defined(__APPLE__)
+  for (auto const& action : actions) {
+    auto pid = fork();
+    ASSERT_NE(pid, -1);
+    if (pid == 0) {
+      alarm(60);  // A child that waits on the parent's threads is killed rather than hanging.
+      std::int32_t rc{0};
+      try {
+        if (action == "load_config") {
+          Json config{Object{}};
+          gbtree.SaveConfig(&config);
+          gbtree.LoadConfig(config);
+        } else if (action == "free") {
+          p_gbm.reset();
+        } else {
+          gbtree.DoBoost(p_fmat, &gpair, nullptr);
+          rc = gbtree.TargetWorkerBuildsForTest() == 2 ? 0 : 3;
+        }
+      } catch (...) {
+        rc = 2;
+      }
+      _exit(rc);
+    }
+    int status{0};
+    ASSERT_EQ(waitpid(pid, &status, 0), pid);
+    EXPECT_TRUE(WIFEXITED(status)) << action << ": killed by signal " << WTERMSIG(status);
+    EXPECT_EQ(WEXITSTATUS(status), 0) << action;
+  }
+}
+#endif  // !defined(_WIN32)
 }  // namespace xgboost

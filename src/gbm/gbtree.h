@@ -17,7 +17,8 @@
 #include <utility>
 #include <vector>
 
-#include "../common/kernel.h"  // for DispatchKernel
+#include "../common/kernel.h"      // for DispatchKernel
+#include "../common/threadpool.h"  // for ThreadPool
 #include "../common/timer.h"
 #include "../predictor/prediction_kernel.h"
 #include "../predictor/prediction_shape.h"
@@ -65,6 +66,8 @@ struct GBTreeTrainParam : public XGBoostParameter<GBTreeTrainParam> {
   TreeProcessType process_type;
   // tree construction method
   TreeMethod tree_method;
+  // Whether to build the trees of different targets at the same time, see GBTree::BoostTargets.
+  bool parallel_target_trees;
   // declare parameters
   DMLC_DECLARE_PARAMETER(GBTreeTrainParam) {
     DMLC_DECLARE_FIELD(updater_seq).describe("Tree updater sequence.").set_default("");
@@ -83,6 +86,14 @@ struct GBTreeTrainParam : public XGBoostParameter<GBTreeTrainParam> {
         .add_enum("exact", TreeMethod::kExact)
         .add_enum("hist", TreeMethod::kHist)
         .describe("Choice of tree construction method.");
+    DMLC_DECLARE_FIELD(parallel_target_trees)
+        .set_default(false)
+        .describe(
+            "With multi_strategy=one_output_per_tree, build the trees of different targets (for "
+            "example the classes of a multi-class objective) at the same time, each with a share "
+            "of the threads. Built at the same time only with CPU hist; otherwise one after "
+            "another, with a warning. Each target samples from its own seed, so with sampling "
+            "or DART dropout the model differs from one trained without this parameter.");
   }
 };
 
@@ -213,6 +224,7 @@ class GBTree : public GradientBooster {
       : GradientBooster{ctx}, model_(booster_config, ctx_) {
     monitor_.Init(__func__);
   }
+  ~GBTree() override;
 
   std::set<std::string> Configure(Args const& cfg) override;
   /**
@@ -234,6 +246,18 @@ class GBTree : public GradientBooster {
              bool* out_of_bound) const override;
 
   [[nodiscard]] std::int32_t BoostedRounds() const override { return this->model_.BoostedRounds(); }
+
+  // Test-only accessor: the thread count of each worker kept by BoostTargets. Empty if the
+  // targets were last built one after another or LoadConfig reset the workers.
+  [[nodiscard]] std::vector<std::int32_t> TargetWorkerThreadsForTest() const {
+    std::vector<std::int32_t> n_threads;
+    for (auto const& worker : target_workers_) {
+      n_threads.push_back(worker.ctx->nthread);
+    }
+    return n_threads;
+  }
+  // Test-only accessor: how many times BoostTargets has created its workers.
+  [[nodiscard]] std::int32_t TargetWorkerBuildsForTest() const { return n_target_worker_builds_; }
 
   // Test-only accessor. The cache entry is thread-local and must have been initialized by
   // PredictBatch or DoBoost on this thread.
@@ -396,6 +420,29 @@ class GBTree : public GradientBooster {
 
   std::vector<RegTree*> InitNewTrees(bst_target_t bst_group, TreesOneGroup* ret);
 
+  void CheckGradientSize(GradientContainer const& gpair, DMatrix const* p_fmat) const;
+
+  /**
+   * @brief The number of workers that build the trees of the targets at the same time, or 1 to
+   *        build them one after another. Prepares the updaters for a concurrent build.
+   */
+  [[nodiscard]] std::int32_t NumTargetWorkers(DMatrix* p_fmat, bst_target_t n_groups);
+  void InitTargetWorkers(std::int32_t n_workers);
+  void ResetTargetWorkers();
+  /**
+   * @brief Build one group of trees per target of a multi-target model with scalar leaves, with
+   *        n_workers workers at the same time, each with its own updaters and share of the
+   *        threads, or on this thread if n_workers is 1.
+   *
+   * @param out_preds The training prediction cache, one column per target. Each target updates
+   *                  its own column from its leaf positions.
+   *
+   * @return Whether the prediction cache was updated for every target.
+   */
+  [[nodiscard]] bool BoostTargets(GradientContainer* in_gpair, DMatrix* p_fmat,
+                                  std::int32_t n_workers, linalg::MatrixView<float> out_preds,
+                                  TreesOneIter* out_trees);
+
   // commit new trees all at once
   virtual void CommitModel(TreesOneIter&& new_trees);
 
@@ -412,6 +459,27 @@ class GBTree : public GradientBooster {
   // The leaf position of each row, one for each new tree in a group. The position is negated
   // if the row is sampled out. Kept between iterations to reuse the memory.
   std::vector<HostDeviceVector<bst_node_t>> node_position_;
+  // A worker of BoostTargets, kept between iterations to reuse its memory.
+  struct TargetWorker {
+    // On the heap so that its address, which the updaters keep, survives moves.
+    std::unique_ptr<Context> ctx;
+    std::vector<std::unique_ptr<TreeUpdater>> updaters;
+    // The gradient and leaf positions of the target the worker is building.
+    GradientContainer gpair;
+    std::vector<HostDeviceVector<bst_node_t>> positions;
+  };
+  std::vector<TargetWorker> target_workers_;
+  // The updater configurations the workers were created from.
+  std::string target_workers_config_;
+  std::int32_t n_target_worker_builds_{0};
+  // Threads of workers 1 and up; worker 0 runs on the calling thread. Kept between iterations so
+  // that each thread keeps its OpenMP team.
+  std::unique_ptr<common::ThreadPool> target_pool_;
+  // The process that started the pool's threads. A child forked from it has none of them.
+  std::int64_t target_pool_pid_{0};
+  // The reason last logged for building the targets one after another, so that it is logged
+  // once rather than every iteration.
+  std::string target_fallback_reason_;
   // indexes of dropped trees
   std::vector<size_t> idx_drop_;
   mutable PredictionContainer prediction_cache_;

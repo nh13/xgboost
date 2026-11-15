@@ -13,17 +13,26 @@
 #include <algorithm>  // for equal, any_of
 #include <cstddef>    // for size_t
 #include <cstdint>    // for uint32_t
+#include <future>     // for future
 #include <memory>
+#include <optional>  // for optional
 #include <string>
+#include <tuple>  // for ignore
 #include <utility>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <unistd.h>  // for getpid
+#endif               // !defined(_WIN32)
+
+#include "../collective/communicator-inl.h"  // for IsDistributed
 #include "../common/common.h"
 #include "../common/cuda_rt_utils.h"  // for AllVisibleGPUs
 #include "../common/error_msg.h"  // for UnknownDevice, WarnOldSerialization, InplacePredictProxy
 #include "../common/kernel.h"
 #include "../common/threading_utils.h"
 #include "../common/timer.h"
+#include "../common/utils.h"        // for MakeCleanup
 #include "../data/proxy_dmatrix.h"  // for DMatrixProxy, HostAdapterDispatch
 #include "../predictor/prediction_kernel.h"
 #include "gbtree_model.h"
@@ -31,6 +40,7 @@
 #include "xgboost/base.h"
 #include "xgboost/data.h"
 #include "xgboost/gbm.h"
+#include "xgboost/global_config.h"  // for InitNewThread
 #include "xgboost/host_device_vector.h"
 #include "xgboost/json.h"
 #include "xgboost/logging.h"
@@ -85,6 +95,59 @@ bool UpdatersMatched(std::vector<std::string> updater_seq,
                     });
 }
 
+std::unique_ptr<TreeUpdater> CreateUpdater(std::string const& name, Context const* ctx,
+                                           ObjInfo const* task, Json const& config) {
+  std::unique_ptr<TreeUpdater> up{TreeUpdater::Create(name, ctx, task)};
+  up->LoadConfig(config);
+  return up;
+}
+
+// Divides the learning rate by the number of trees built per target, until the guard is
+// destroyed.
+[[nodiscard]] auto ScaleLearningRate(tree::TrainParam* param, std::size_t n_trees) {
+  auto const lr = param->learning_rate;
+  param->learning_rate /= static_cast<float>(n_trees);
+  return common::MakeCleanup([param, lr] { param->learning_rate = lr; });
+}
+
+void ResetPositions(std::vector<HostDeviceVector<bst_node_t>>* positions, std::size_t n_trees) {
+  positions->resize(n_trees);
+  for (auto& position : *positions) {
+    // Empty positions tell the updaters that none were written for this tree, for example
+    // `prune` computes them if it runs first. Resizing keeps the memory for the next tree.
+    position.Resize(0);
+  }
+}
+
+// Adds the leaf values of trees at the rows' leaf positions to out_preds. Returns false, leaving
+// out_preds unchanged, if the updaters didn't record a position for every row.
+bool PredictFromPositions(Context const* ctx, std::vector<HostDeviceVector<bst_node_t>>* positions,
+                          TreesOneGroup const& trees, linalg::MatrixView<float> out_preds) {
+  CHECK_EQ(positions->size(), trees.size());
+  for (auto& position : *positions) {
+    if (out_preds.Shape(0) != 0 && position.Size() != out_preds.Shape(0)) {
+      return false;
+    }
+    position.SetDevice(out_preds.Device());
+  }
+  std::vector<RegTree const*> tree_ptrs;
+  tree_ptrs.reserve(trees.size());
+  for (auto const& tree : trees) {
+    tree_ptrs.push_back(tree.get());
+  }
+  common::DispatchKernel<predictor::PredictFromLeafIdsKernel>(ctx, common::Span{*positions},
+                                                              common::Span{tree_ptrs}, out_preds);
+  return true;
+}
+
+std::int64_t CurrentProcessId() {
+#if defined(_WIN32)
+  return 0;  // Windows has no fork.
+#else
+  return static_cast<std::int64_t>(getpid());
+#endif  // defined(_WIN32)
+}
+
 }  // namespace
 
 std::set<std::string> GBTree::Configure(Args const& cfg) {
@@ -124,6 +187,7 @@ std::set<std::string> GBTree::Configure(Args const& cfg) {
   for (auto& up : updaters_) {
     used.merge(up->Configure(cfg));
   }
+  // The workers are recreated on the next iteration if the updaters' configuration changed.
   return used;
 }
 
@@ -226,31 +290,11 @@ void GBTree::DoBoost(std::shared_ptr<DMatrix> p_fmat, GradientContainer* in_gpai
                                     model_.learner_model_state->OutputLength());
   CHECK_NE(n_groups, 0);
 
-  auto predict_from_node_positions = [&](std::vector<HostDeviceVector<bst_node_t>>& positions,
-                                         TreesOneGroup const& trees,
-                                         linalg::MatrixView<float> out_preds) {
-    CHECK_EQ(positions.size(), trees.size());
-    for (auto& position : positions) {
-      if (out_preds.Shape(0) != 0 && position.Size() != out_preds.Shape(0)) {
-        return false;
-      }
-      position.SetDevice(predt->predictions.Device());
-    }
-    std::vector<RegTree const*> tree_ptrs;
-    tree_ptrs.reserve(trees.size());
-    for (auto const& tree : trees) {
-      tree_ptrs.push_back(tree.get());
-    }
-    common::DispatchKernel<predictor::PredictFromLeafIdsKernel>(ctx_, common::Span{positions},
-                                                                common::Span{tree_ptrs}, out_preds);
-    return true;
-  };
-
   if (model_.learner_model_state->IsVectorLeaf() ||
       model_.learner_model_state->OutputLength() == 1u) {
     TreesOneGroup ret;
     BoostNewTrees(in_gpair, p_fmat.get(), 0, &node_position_, &ret);
-    if (predict_from_node_positions(node_position_, ret, out)) {
+    if (PredictFromPositions(ctx_, &node_position_, ret, out)) {
       predt->Update(1);
     }
     new_trees.push_back(std::move(ret));
@@ -258,18 +302,9 @@ void GBTree::DoBoost(std::shared_ptr<DMatrix> p_fmat, GradientContainer* in_gpai
     // Multi-target, scalar leaf
     CHECK_EQ(in_gpair->gpair.Size() % n_groups, 0U)
         << "Must have exactly n_groups * n_samples gpairs.";
-    GradientContainer tmp;
-    tmp.gpair = linalg::Matrix<GradientPair>{
-        {in_gpair->gpair.Shape(0), static_cast<std::size_t>(1ul)}, ctx_->Device()};
-    bool cache_updated{true};
-    for (bst_target_t gid = 0; gid < n_groups; ++gid) {
-      CopyGradient(ctx_, &in_gpair->gpair, gid, &tmp.gpair);
-      TreesOneGroup ret;
-      BoostNewTrees(&tmp, p_fmat.get(), gid, &node_position_, &ret);
-      auto v_predt = out.Slice(linalg::All(), linalg::Range(gid, gid + 1));
-      cache_updated = predict_from_node_positions(node_position_, ret, v_predt) && cache_updated;
-      new_trees.push_back(std::move(ret));
-    }
+    auto const n_workers = this->NumTargetWorkers(p_fmat.get(), n_groups);
+    bool const cache_updated =
+        this->BoostTargets(in_gpair, p_fmat.get(), n_workers, out, &new_trees);
     if (cache_updated) {
       predt->Update(1);
     }
@@ -316,36 +351,239 @@ std::vector<RegTree*> GBTree::InitNewTrees(bst_target_t bst_group, TreesOneGroup
   return new_trees;
 }
 
+std::int32_t GBTree::NumTargetWorkers(DMatrix* p_fmat, bst_target_t n_groups) {
+  if (!tparam_.parallel_target_trees) {
+    return 1;
+  }
+  auto const n_threads = ctx_->Threads();
+  std::string reason;
+#if defined(XGBOOST_STRICT_R_MODE) && XGBOOST_STRICT_R_MODE == 1
+  // R allows its console functions, which log messages, only on R's main thread.
+  reason = "the R package logs only from R's main thread";
+#elif defined(XGBOOST_USE_THREADPOOL)
+  // The workers' parallel loops would all run on the one global pool, which grows only to the
+  // largest worker's share, instead of on a team of threads each.
+  reason = "this build runs parallel loops on one shared thread pool";
+#else
+  if (n_threads < 2) {
+    reason = "it needs more than one thread";
+  } else if (!ctx_->IsCPU()) {
+    reason = "it supports only CPU training";
+  } else if (tparam_.process_type != TreeProcessType::kDefault) {
+    reason = "it supports only `process_type=default`";
+  } else if (collective::IsDistributed()) {
+    reason = "it doesn't support distributed training";
+  } else {
+    for (auto const& up : updaters_) {
+      if (!up->PrepareConcurrentBuild(&tree_param_, p_fmat)) {
+        reason = "the `" + std::string(up->Name()) + "` updater doesn't support it with this data";
+        break;
+      }
+    }
+  }
+#endif  // defined(XGBOOST_STRICT_R_MODE) && XGBOOST_STRICT_R_MODE == 1
+  if (reason != target_fallback_reason_ && !reason.empty()) {
+    LOG(WARNING) << "`parallel_target_trees` builds the targets one after another: " << reason
+                 << ".";
+  }
+  target_fallback_reason_ = reason;
+  if (!reason.empty()) {
+    return 1;
+  }
+  return std::min(static_cast<std::int32_t>(n_groups), n_threads);
+}
+
+GBTree::~GBTree() { this->ResetTargetWorkers(); }
+
+void GBTree::ResetTargetWorkers() {
+  if (target_pool_ && target_pool_pid_ != CurrentProcessId()) {
+    // A forked child has none of the pool's threads, so joining them would fail: abandon it.
+    std::ignore = target_pool_.release();
+  }
+  // Join the threads before destroying the workers they could run.
+  target_pool_.reset();
+  target_workers_.clear();
+  target_workers_config_.clear();
+}
+
+void GBTree::InitTargetWorkers(std::int32_t n_workers) {
+  // Split the threads between the workers, the first ones taking the remainder.
+  auto const n_threads = ctx_->Threads();
+  auto threads_of = [&](std::int32_t w) {
+    return n_threads / n_workers + static_cast<std::int32_t>(w < n_threads % n_workers);
+  };
+  // The workers copy the updaters' configuration, so they are recreated when it changes.
+  std::vector<Json> configs;
+  Json all_configs{Array{}};
+  for (auto const& up : updaters_) {
+    Json config{Object{}};
+    up->SaveConfig(&config);
+    configs.push_back(config);
+    get<Array>(all_configs).emplace_back(Object{});
+    get<Array>(all_configs).back()["name"] = String{up->Name()};
+    get<Array>(all_configs).back()["config"] = config;
+  }
+  std::string config_str;
+  Json::Dump(all_configs, &config_str);
+
+  bool reuse = target_pool_ && target_pool_pid_ == CurrentProcessId() &&
+               target_workers_config_ == config_str &&
+               target_workers_.size() == static_cast<std::size_t>(n_workers);
+  for (std::int32_t w = 0; reuse && w < n_workers; ++w) {
+    reuse = target_workers_[w].ctx->nthread == threads_of(w);
+  }
+  if (reuse) {
+    return;
+  }
+  this->ResetTargetWorkers();
+  for (std::int32_t w = 0; w < n_workers; ++w) {
+    TargetWorker worker;
+    worker.ctx = std::make_unique<Context>(*ctx_);
+    worker.ctx->nthread = threads_of(w);
+    for (std::size_t i = 0; i < updaters_.size(); ++i) {
+      worker.updaters.push_back(CreateUpdater(updaters_[i]->Name(), worker.ctx.get(),
+                                              &model_.learner_model_state->task, configs[i]));
+    }
+    target_workers_.push_back(std::move(worker));
+  }
+  // Each thread is a separate OpenMP root with its own team, so the workers' parallel regions
+  // run side by side instead of nesting. BoostTargets initializes the threads for each task.
+  target_pool_ =
+      std::make_unique<common::ThreadPool>(StringView{"tgt-trees"}, n_workers - 1, [] {});
+  target_pool_pid_ = CurrentProcessId();
+  target_workers_config_ = std::move(config_str);
+  ++n_target_worker_builds_;
+}
+
+bool GBTree::BoostTargets(GradientContainer* in_gpair, DMatrix* p_fmat, std::int32_t n_workers,
+                          linalg::MatrixView<float> out_preds, TreesOneIter* out_trees) {
+  auto const n_groups = model_.learner_model_state->OutputLength();
+  // Everything that touches the model or the booster's state happens on this thread, before
+  // the workers start. InitNewTrees moves trees of the model with process_type=update.
+  out_trees->resize(n_groups);
+  std::vector<std::vector<RegTree*>> new_trees(n_groups);
+  for (bst_target_t gid = 0; gid < n_groups; ++gid) {
+    new_trees[gid] = this->InitNewTrees(gid, &(*out_trees)[gid]);
+  }
+  // With parallel_target_trees, each target samples from its own seed, drawn in target order,
+  // so the model doesn't depend on whether, or by which worker, the targets are built at the
+  // same time. Building on this thread reseeds the booster's generator, which is restored after.
+  std::vector<RandomEngine::result_type> seeds;
+  if (tparam_.parallel_target_trees) {
+    for (bst_target_t gid = 0; gid < n_groups; ++gid) {
+      seeds.push_back(ctx_->Rng()());
+    }
+  }
+  std::optional<RandomEngine> rng_after_seeds;
+  if (!seeds.empty()) {
+    rng_after_seeds = ctx_->Rng();
+  }
+  auto restore_rng = common::MakeCleanup([&] {
+    if (rng_after_seeds) {
+      ctx_->Rng() = *rng_after_seeds;
+    }
+  });
+  // The updaters keep the address of the training parameter, so it must outlive this call.
+  auto restore_lr = ScaleLearningRate(&tree_param_, new_trees.front().size());
+
+  std::vector<char> cache_updated(n_groups, 0);
+  auto build = [&](Context const* ctx, std::vector<std::unique_ptr<TreeUpdater>> const& updaters,
+                   GradientContainer* gpair, std::vector<HostDeviceVector<bst_node_t>>* positions,
+                   bst_target_t gid) {
+    CopyGradient(ctx, &in_gpair->gpair, gid, &gpair->gpair);
+    this->CheckGradientSize(*gpair, p_fmat);
+    ResetPositions(positions, new_trees[gid].size());
+    if (!seeds.empty()) {
+      ctx->Rng().seed(seeds[gid]);
+    }
+    for (auto const& up : updaters) {
+      up->Update(&tree_param_, gpair, p_fmat, common::Span{*positions}, new_trees[gid]);
+    }
+    // Each target writes its own column of the cache, so workers can update it concurrently.
+    auto v_preds = out_preds.Slice(linalg::All(), linalg::Range(gid, gid + 1));
+    cache_updated[gid] = PredictFromPositions(ctx, positions, (*out_trees)[gid], v_preds);
+  };
+
+  if (n_workers == 1) {
+    // Free the workers of earlier concurrent builds.
+    this->ResetTargetWorkers();
+    GradientContainer gpair;
+    for (bst_target_t gid = 0; gid < n_groups; ++gid) {
+      build(ctx_, updaters_, &gpair, &node_position_, gid);
+    }
+  } else {
+    monitor_.Start("BoostTargetsConcurrently");
+    this->InitTargetWorkers(n_workers);
+    // Every worker reads the gradient. Bringing it to the host here keeps its lazy copy, which
+    // writes to it, off the workers.
+    std::ignore = in_gpair->gpair.HostView();
+    auto run = [&](std::int32_t w) {
+      auto& worker = target_workers_[w];
+      // A fixed assignment keeps each target on the same worker, and so the same thread count,
+      // from run to run.
+      for (bst_target_t gid = w; gid < n_groups; gid += n_workers) {
+        build(worker.ctx.get(), worker.updaters, &worker.gpair, &worker.positions, gid);
+      }
+    };
+    // The global configuration and the log callback are thread-local, so each task starts from
+    // this thread's. Training is on the CPU, so the tasks don't select a GPU.
+    InitNewThread init;
+    init.device = -1;
+    auto const log_callback = LogCallbackRegistryStore::Get()->Get();
+    std::vector<std::future<void>> futures;
+    futures.reserve(n_workers - 1);
+    // Wait for every started worker before leaving, even on an error: they use this frame.
+    auto drain = common::MakeCleanup([&] {
+      for (auto& future : futures) {
+        if (future.valid()) {
+          future.wait();
+        }
+      }
+    });
+    for (std::int32_t w = 1; w < n_workers; ++w) {
+      futures.push_back(target_pool_->Submit([&run, &init, log_callback, w] {
+        init();
+        LogCallbackRegistryStore::Get()->Register(log_callback);
+        run(w);
+      }));
+    }
+    run(0);
+    for (auto& future : futures) {
+      future.get();
+    }
+    monitor_.Stop("BoostTargetsConcurrently");
+  }
+  return std::all_of(cache_updated.cbegin(), cache_updated.cend(),
+                     [](char updated) { return updated != 0; });
+}
+
+void GBTree::CheckGradientSize(GradientContainer const& gpair, DMatrix const* p_fmat) const {
+  auto n_out = model_.learner_model_state->OutputLength() * p_fmat->Info().num_row_;
+  StringView msg{
+      "Mismatching size between number of rows from input data and size of gradient vector."};
+  if (!model_.learner_model_state->IsVectorLeaf() && p_fmat->Info().num_row_ != 0) {
+    CHECK_EQ(n_out % gpair.gpair.Size(), 0) << msg;
+  } else if (model_.learner_model_state->IsVectorLeaf()) {
+    // vector leaf
+    CHECK_EQ(gpair.gpair.Size(), n_out) << msg;
+  }
+}
+
 void GBTree::BoostNewTrees(GradientContainer* gpair, DMatrix* p_fmat, int bst_group,
                            std::vector<HostDeviceVector<bst_node_t>>* out_position,
                            TreesOneGroup* ret) {
   std::vector<RegTree*> new_trees = this->InitNewTrees(bst_group, ret);
 
   // update the trees
-  auto n_out = model_.learner_model_state->OutputLength() * p_fmat->Info().num_row_;
-  StringView msg{
-      "Mismatching size between number of rows from input data and size of gradient vector."};
-  if (!model_.learner_model_state->IsVectorLeaf() && p_fmat->Info().num_row_ != 0) {
-    CHECK_EQ(n_out % gpair->gpair.Size(), 0) << msg;
-  } else if (model_.learner_model_state->IsVectorLeaf()) {
-    // vector leaf
-    CHECK_EQ(gpair->gpair.Size(), n_out) << msg;
-  }
-
-  out_position->resize(new_trees.size());
-  for (auto& position : *out_position) {
-    // Empty positions tell the updaters that none were written for this tree, for example
-    // `prune` computes them if it runs first. Resizing keeps the memory for the next tree.
-    position.Resize(0);
-  }
+  this->CheckGradientSize(*gpair, p_fmat);
+  ResetPositions(out_position, new_trees.size());
 
   auto n_targets = gpair->gpair.Shape(1);
   auto n_components = static_cast<std::size_t>(tree_param_.multi_projection_ratio * n_targets);
   CHECK_GT(n_components, 0) << "multi_projection_ratio must retain at least one target.";
 
   // Rescale learning rate according to the number of trees
-  auto lr = tree_param_.learning_rate;
-  tree_param_.learning_rate /= static_cast<float>(new_trees.size());
+  auto restore_lr = ScaleLearningRate(&tree_param_, new_trees.size());
   if (n_components < n_targets) {
     gpair->value_gpair = std::move(gpair->gpair);
     auto full_view = std::as_const(gpair->value_gpair).View(ctx_->Device());
@@ -363,7 +601,6 @@ void GBTree::BoostNewTrees(GradientContainer* gpair, DMatrix* p_fmat, int bst_gr
   if (n_components < n_targets) {
     gpair->gpair = std::exchange(gpair->value_gpair, {});
   }
-  tree_param_.learning_rate = lr;
 }
 
 void GBTree::CommitModel(TreesOneIter&& new_trees) {
@@ -433,9 +670,9 @@ void GBTree::LoadConfig(Json const& in) {
       name = "grow_quantile_histmaker";
       LOG(WARNING) << "Changing updater from `grow_gpu_hist` to `grow_quantile_histmaker`.";
     }
-    updaters_.emplace_back(TreeUpdater::Create(name, ctx_, &model_.learner_model_state->task));
-    updaters_.back()->LoadConfig(config);
+    updaters_.push_back(CreateUpdater(name, ctx_, &model_.learner_model_state->task, config));
   }
+  this->ResetTargetWorkers();
 
   specified_updater_ = get<Boolean>(config["specified_updater"]);
 }

@@ -282,6 +282,32 @@ Parameters for Tree Booster
 
   - range: (0, 1]
 
+* ``parallel_target_trees`` [default = ``false``]
+
+  .. versionadded:: 3.5.0
+
+  With ``multi_strategy=one_output_per_tree``, build the trees of the different targets (for
+  example the classes of ``multi:softprob``) at the same time instead of one after another. The
+  threads are split between the targets. This helps when a tree uses the threads poorly, for
+  example with small data or many threads, and can be slower with fewer than about three threads
+  per target. It has no effect, and logs no warning, with a single target or with
+  ``multi_strategy=multi_output_tree``.
+
+  It needs the CPU ``hist`` tree method with its default ``updater`` and ``process_type``, more
+  than one thread, and an in-memory ``DMatrix`` or ``QuantileDMatrix``. Otherwise, including in
+  distributed training, in the R package and in builds with ``USE_THREADPOOL``, the targets are
+  built one after another, with a warning, and the per-target seeds described below still apply.
+
+  Each worker, one per target up to the number of threads, uses its own copy of the tree updater,
+  so training needs more memory, roughly that of one more tree builder per extra worker. The
+  booster keeps the workers and their threads between iterations.
+
+  With this parameter, each target draws its random numbers from its own seed, taken from the
+  booster's random generator. With ``subsample``, a ``colsample_*`` parameter below 1 or DART
+  dropout, the model therefore differs from the one trained without this parameter. The random
+  draws are reproducible for a given ``seed`` and don't depend on the number of threads, but as
+  with any change of ``nthread``, the trees can differ slightly.
+
 
 Parameters for Non-Exact Tree Methods
 =====================================

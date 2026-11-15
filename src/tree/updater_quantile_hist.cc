@@ -8,6 +8,7 @@
 #include <cstddef>    // for size_t
 #include <cstdint>    // for uint32_t, int32_t
 #include <memory>     // for allocator, unique_ptr, make_unique, shared_ptr
+#include <tuple>      // for ignore
 #include <utility>    // for move, pair
 #include <vector>     // for vector
 
@@ -19,6 +20,8 @@
 #include "../common/threading_utils.h"       // for ParallelFor
 #include "../common/timer.h"                 // for Monitor
 #include "../data/gradient_index.h"          // for GHistIndexMatrix
+#include "../data/iterative_dmatrix.h"       // for IterativeDMatrix
+#include "../data/simple_dmatrix.h"          // for SimpleDMatrix
 #include "common_row_partitioner.h"          // for CommonRowPartitioner
 #include "dmlc/registry.h"                   // for DMLC_REGISTRY_FILE_TAG
 #include "driver.h"                          // for Driver
@@ -613,6 +616,24 @@ class QuantileHistMaker : public TreeUpdater {
   }
 
   [[nodiscard]] char const *Name() const override { return "grow_quantile_histmaker"; }
+
+  [[nodiscard]] bool PrepareConcurrentBuild(TrainParam const *param, DMatrix *p_fmat) override {
+    // Instances share p_fmat and only read its gradient index, so it must be in memory: external
+    // memory streams its pages. Fetching the index builds it, or builds it again if a parameter
+    // changed, before the instances start.
+    if (dynamic_cast<data::SimpleDMatrix *>(p_fmat) == nullptr &&
+        dynamic_cast<data::IterativeDMatrix *>(p_fmat) == nullptr) {
+      return false;
+    }
+    std::ignore = p_fmat->GetBatches<GHistIndexMatrix>(ctx_, HistBatch(param));
+    // The instances also read these, and copying one to the host writes to it, so copy them on
+    // this thread in case they are on a GPU.
+    auto &info = p_fmat->Info();
+    info.feature_weights.SetDevice(ctx_->Device());
+    std::ignore = info.feature_weights.ConstHostSpan();
+    std::ignore = info.feature_types.ConstHostSpan();
+    return true;
+  }
 
   void Update(TrainParam const *param, GradientContainer *in_gpair, DMatrix *p_fmat,
               common::Span<HostDeviceVector<bst_node_t>> out_position,
