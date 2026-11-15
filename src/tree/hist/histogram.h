@@ -5,41 +5,81 @@
 #define XGBOOST_TREE_HIST_HISTOGRAM_H_
 
 #include <algorithm>  // for max
+#include <array>      // for array
 #include <cstddef>    // for size_t
 #include <cstdint>    // for int32_t
 #include <utility>    // for move
 #include <vector>     // for vector
 
-#include "../../collective/allreduce.h"    // for Allreduce
-#include "../../common/cache_manager.h"    // for CacheManager
-#include "../../common/hist_util.h"        // for GHistRow, ParallelGHi...
-#include "../../common/row_set.h"          // for RowSetCollection
-#include "../../common/threading_utils.h"  // for ParallelFor2d, Range1d, BlockedSpace2d
-#include "../../data/gradient_index.h"     // for GHistIndexMatrix
-#include "expand_entry.h"                  // for CPUExpandEntry
-#include "hist_cache.h"                    // for BoundedHistCollection
-#include "hist_param.h"                    // for HistMakerTrainParam
-#include "xgboost/base.h"                  // for bst_node_t, bst_target_t, bst_bin_t
-#include "xgboost/context.h"               // for Context
-#include "xgboost/data.h"                  // for BatchIterator, BatchSet
-#include "xgboost/linalg.h"                // for MatrixView, All, Vect...
-#include "xgboost/logging.h"               // for CHECK_GE
-#include "xgboost/span.h"                  // for Span
-#include "xgboost/tree_model.h"            // for RegTree
+#include "../../collective/allreduce.h"         // for Allreduce
+#include "../../collective/communicator-inl.h"  // for GetWorldSize
+#include "../../common/cache_manager.h"         // for CacheManager
+#include "../../common/hist_util.h"             // for GHistRow, ParallelGHi...
+#include "../../common/row_set.h"               // for RowSetCollection
+#include "../../common/threading_utils.h"       // for ParallelFor2d, Range1d, BlockedSpace2d
+#include "../../data/gradient_index.h"          // for GHistIndexMatrix
+#include "expand_entry.h"                       // for CPUExpandEntry
+#include "hist_cache.h"                         // for BoundedHistCollection
+#include "hist_param.h"                         // for HistMakerTrainParam
+#include "xgboost/base.h"                       // for bst_node_t, bst_target_t, bst_bin_t
+#include "xgboost/context.h"                    // for Context
+#include "xgboost/data.h"                       // for BatchIterator, BatchSet
+#include "xgboost/linalg.h"                     // for MatrixView, All, Vect...
+#include "xgboost/logging.h"                    // for CHECK_GE
+#include "xgboost/span.h"                       // for Span
+#include "xgboost/tree_model.h"                 // for RegTree
 
 namespace xgboost::tree {
 /**
- * @brief Decide which node as the build node for multi-target trees.
+ * @brief The number of rows in the left and the right child of a candidate, in that order.
  */
-void AssignNodes(MultiTargetTreeView const &tree,
-                 std::vector<CPUExpandEntry> const &valid_candidates,
-                 common::Span<bst_node_t> nodes_to_build, common::Span<bst_node_t> nodes_to_sub);
+using ChildRows = std::array<bst_idx_t, 2>;
 
 /**
- * @brief Decide which node as the build node.
+ * @brief Decide which child of each candidate gets its histogram built. The other child's
+ *        histogram is computed by subtracting it from the parent's.
+ *
+ * Builds the child with fewer rows, as the cost of building a histogram grows with the number of
+ * rows; ties build the left child. Without row counts, as in distributed training with more than
+ * one worker, where each worker counts only its own rows, builds the child with the smaller sum
+ * of Hessian, which every worker agrees on. The GPU tree method always uses the sums of Hessian.
+ *
+ * The child computed by subtraction inherits the rounding error of the parent's sums. When the
+ * parent was itself computed by subtraction, the error builds up along the chain, to about one
+ * ulp of the bins of the nearest ancestor whose histogram was built directly. Choosing by rows
+ * can leave a child with little Hessian to be subtracted, where that error is large relative to
+ * its own sums. A non-zero `min_child_weight` or `lambda` keeps it negligible; with both at 0,
+ * nothing bounds it.
+ *
+ * @param tree   A ScalarTreeView or a MultiTargetTreeView.
+ * @param n_rows The row counts of the children of each candidate, or empty.
  */
-void AssignNodes(ScalarTreeView const &tree, std::vector<CPUExpandEntry> const &candidates,
-                 common::Span<bst_node_t> nodes_to_build, common::Span<bst_node_t> nodes_to_sub);
+template <typename TreeView>
+void AssignNodes(TreeView const &tree, std::vector<CPUExpandEntry> const &candidates,
+                 common::Span<ChildRows const> n_rows, common::Span<bst_node_t> nodes_to_build,
+                 common::Span<bst_node_t> nodes_to_sub);
+
+namespace cpu_impl {
+/**
+ * @brief The row counts of the children of each candidate, summed over the pages. The rows must
+ *        already be partitioned into the children.
+ */
+template <typename Partitioner, typename ExpandEntry, typename TreeView>
+[[nodiscard]] std::vector<ChildRows> CountChildRows(TreeView const &tree,
+                                                    std::vector<Partitioner> const &partitioners,
+                                                    std::vector<ExpandEntry> const &candidates) {
+  std::vector<ChildRows> n_rows(candidates.size(), ChildRows{0, 0});
+  for (auto const &partitioner : partitioners) {
+    auto const &partitions = partitioner.Partitions();
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+      auto nidx = candidates[i].nid;
+      n_rows[i][0] += partitions[tree.LeftChild(nidx)].Size();
+      n_rows[i][1] += partitions[tree.RightChild(nidx)].Size();
+    }
+  }
+  return n_rows;
+}
+}  // namespace cpu_impl
 
 class HistogramBuilder {
   /*! \brief culmulative histogram of gradients. */
@@ -318,6 +358,8 @@ common::BlockedSpace2d ConstructHistSpace(Partitioner const &partitioners,
 class MultiHistogramBuilder {
   std::vector<HistogramBuilder> target_builders_;
   Context const *ctx_;
+  // Whether to choose the child to build by row counts, see AssignNodes.
+  bool use_row_counts_{true};
   common::CacheManager cache_manager_;
 
   bool ReadByColumn(const GHistIndexMatrix &gidx, bool force_read_by_column) const {
@@ -391,9 +433,11 @@ class MultiHistogramBuilder {
                           std::vector<ExpandEntry> const &valid_candidates,
                           linalg::MatrixView<GradientPair const> gpair, BatchParam const &param,
                           bool force_read_by_column = false) {
+    auto n_rows = use_row_counts_ ? cpu_impl::CountChildRows(tree, partitioners, valid_candidates)
+                                  : std::vector<ChildRows>{};
     std::vector<bst_node_t> nodes_to_build(valid_candidates.size());
     std::vector<bst_node_t> nodes_to_sub(valid_candidates.size());
-    AssignNodes(tree, valid_candidates, nodes_to_build, nodes_to_sub);
+    AssignNodes(tree, valid_candidates, n_rows, nodes_to_build, nodes_to_sub);
 
     // use the first builder for getting number of valid nodes.
     target_builders_.front().AddHistRows(tree, &nodes_to_build, &nodes_to_sub, true);
@@ -439,6 +483,9 @@ class MultiHistogramBuilder {
   void Reset(Context const *ctx, bst_bin_t total_bins, bst_target_t n_targets, BatchParam const &p,
              bool is_distributed, HistMakerTrainParam const *param) {
     ctx_ = ctx;
+    // Each worker counts only its own rows, but SyncHistogram's allreduce needs every worker to
+    // build the same nodes.
+    use_row_counts_ = !is_distributed || collective::GetWorldSize() == 1;
     target_builders_.resize(n_targets);
     CHECK_GE(n_targets, 1);
     for (auto &v : target_builders_) {

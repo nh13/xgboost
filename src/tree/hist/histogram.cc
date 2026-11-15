@@ -1,5 +1,5 @@
 /**
- * Copyright 2023-2025, XGBoost Contributors
+ * Copyright 2023-2026, XGBoost Contributors
  */
 #include "histogram.h"
 
@@ -16,50 +16,38 @@
 #include "xgboost/tree_model.h"               // for RegTree
 
 namespace xgboost::tree {
-void AssignNodes(MultiTargetTreeView const &tree,
-                 std::vector<CPUExpandEntry> const &valid_candidates,
-                 common::Span<bst_node_t> nodes_to_build, common::Span<bst_node_t> nodes_to_sub) {
-  CHECK_EQ(nodes_to_build.size(), valid_candidates.size());
-
-  std::size_t n_idx = 0;
-  for (auto const &c : valid_candidates) {
-    auto left_nidx = tree.LeftChild(c.nid);
-    auto right_nidx = tree.RightChild(c.nid);
-
-    auto build_nidx = left_nidx;
-    auto subtract_nidx = right_nidx;
-    auto lit =
-        common::MakeIndexTransformIter([&](auto i) { return c.split.left_sum[i].GetHess(); });
-    auto left_sum = std::accumulate(lit, lit + c.split.left_sum.size(), .0);
-    auto rit =
-        common::MakeIndexTransformIter([&](auto i) { return c.split.right_sum[i].GetHess(); });
-    auto right_sum = std::accumulate(rit, rit + c.split.right_sum.size(), .0);
-    auto fewer_right = right_sum < left_sum;
-    if (fewer_right) {
+template <typename TreeView>
+void AssignNodes(TreeView const &tree, std::vector<CPUExpandEntry> const &candidates,
+                 common::Span<ChildRows const> n_rows, common::Span<bst_node_t> nodes_to_build,
+                 common::Span<bst_node_t> nodes_to_sub) {
+  CHECK_EQ(nodes_to_build.size(), candidates.size());
+  CHECK(n_rows.empty() || n_rows.size() == candidates.size())
+      << "Need the row counts of the children of every candidate.";
+  auto sum_hess = [](auto const &sums) {
+    auto it = common::MakeIndexTransformIter([&](auto i) { return sums[i].GetHess(); });
+    return std::accumulate(it, it + sums.size(), .0);
+  };
+  for (std::size_t i = 0; i < candidates.size(); ++i) {
+    auto const &c = candidates[i];
+    auto build_nidx = tree.LeftChild(c.nid);
+    auto subtract_nidx = tree.RightChild(c.nid);
+    auto build_right = n_rows.empty() ? sum_hess(c.split.right_sum) < sum_hess(c.split.left_sum)
+                                      : n_rows[i][1] < n_rows[i][0];
+    if (build_right) {
       std::swap(build_nidx, subtract_nidx);
     }
-    nodes_to_build[n_idx] = build_nidx;
-    nodes_to_sub[n_idx] = subtract_nidx;
-    ++n_idx;
+    nodes_to_build[i] = build_nidx;
+    nodes_to_sub[i] = subtract_nidx;
   }
 }
 
-void AssignNodes(ScalarTreeView const &tree, std::vector<CPUExpandEntry> const &candidates,
-                 common::Span<bst_node_t> nodes_to_build, common::Span<bst_node_t> nodes_to_sub) {
-  std::size_t n_idx = 0;
-  for (auto const &c : candidates) {
-    auto left_nidx = tree.LeftChild(c.nid);
-    auto right_nidx = tree.RightChild(c.nid);
-    auto fewer_right = c.split.right_sum[0].GetHess() < c.split.left_sum[0].GetHess();
-
-    auto build_nidx = left_nidx;
-    auto subtract_nidx = right_nidx;
-    if (fewer_right) {
-      std::swap(build_nidx, subtract_nidx);
-    }
-    nodes_to_build[n_idx] = build_nidx;
-    nodes_to_sub[n_idx] = subtract_nidx;
-    ++n_idx;
-  }
-}
+template void AssignNodes(ScalarTreeView const &tree, std::vector<CPUExpandEntry> const &candidates,
+                          common::Span<ChildRows const> n_rows,
+                          common::Span<bst_node_t> nodes_to_build,
+                          common::Span<bst_node_t> nodes_to_sub);
+template void AssignNodes(MultiTargetTreeView const &tree,
+                          std::vector<CPUExpandEntry> const &candidates,
+                          common::Span<ChildRows const> n_rows,
+                          common::Span<bst_node_t> nodes_to_build,
+                          common::Span<bst_node_t> nodes_to_sub);
 }  // namespace xgboost::tree

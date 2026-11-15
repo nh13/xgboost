@@ -12,7 +12,7 @@
 #include <xgboost/tree_model.h>          // for RegTree
 
 #include <algorithm>  // for max
-#include <cmath>      // for nextafter
+#include <cmath>      // for ldexp, nextafter
 #include <cstddef>    // for size_t
 #include <cstdint>    // for int32_t, uint32_t
 #include <iterator>   // for back_inserter
@@ -158,6 +158,165 @@ TEST(CPUHistogram, DistributedMinChildWeight) {
   collective::TestDistributedGlobal(2, [] {
     TestHistogramMinChildWeight(false, true);
     TestHistogramMinChildWeight(true, true);
+  });
+}
+
+namespace {
+// Trees in which the root and its left child, node 1, are both split, with scalar leaves and with
+// vector leaves.
+std::unique_ptr<RegTree> MakeTwoSplitTree() {
+  auto p_tree = std::make_unique<RegTree>();
+  p_tree->Expand({{0, 0, 0.5f, false}, {0.0, 10.0}, {0.0, 1.0}, {0.0, 9.0}, 1.0});
+  p_tree->Expand({{1, 0, 0.25f, false}, {0.0, 1.0}, {0.0, 0.9}, {0.0, 0.1}, 1.0});
+  return p_tree;
+}
+
+std::unique_ptr<RegTree> MakeTwoSplitTree(bst_target_t n_targets) {
+  Context ctx;
+  auto p_tree = std::make_unique<RegTree>(n_targets, 2);
+  std::vector<float> weight(n_targets, 1.0f);
+  common::Span<float const> w{weight};
+  p_tree->SetRoot(linalg::MakeVec(weight.data(), n_targets), 10.0f);
+  p_tree->Expand(&ctx, {{{0, 0, 0.5f, false}, {w, 10.0}, {w, 1.0}, {w, 9.0}, 1.0f}});
+  p_tree->Expand(&ctx, {{{1, 0, 0.25f, false}, {w, 1.0}, {w, 0.9}, {w, 0.1}, 1.0f}});
+  return p_tree;
+}
+
+template <typename TreeView>
+void TestAssignNodes(TreeView const &view, bst_target_t n_targets) {
+  // Row counts and sums of Hessian disagree in every check below, so each checks one rule.
+  auto make_candidate = [&](bst_node_t nidx, double left_hess, double right_hess) {
+    std::vector<GradientPairPrecise> left(n_targets, {0.0, left_hess});
+    std::vector<GradientPairPrecise> right(n_targets, {0.0, right_hess});
+    CPUExpandEntry c{nidx, nidx == 0 ? 0 : 1};
+    c.split.Update(1.0f, 0, 0.5f, false, false, linalg::MakeVec(left.data(), n_targets),
+                   linalg::MakeVec(right.data(), n_targets));
+    return c;
+  };
+  // The root's left child has less Hessian, node 1's right child does.
+  auto root = make_candidate(0, 1.0, 9.0), node1 = make_candidate(1, 0.9, 0.1);
+  auto check = [&](std::vector<CPUExpandEntry> const &candidates,
+                   std::vector<ChildRows> const &n_rows, std::vector<bst_node_t> const &expected) {
+    std::vector<bst_node_t> build(candidates.size()), sub(candidates.size());
+    AssignNodes(view, candidates, n_rows, build, sub);
+    ASSERT_EQ(build, expected);
+    for (std::size_t i = 0; i < candidates.size(); ++i) {
+      auto nidx = candidates[i].nid;
+      ASSERT_EQ(sub[i],
+                build[i] == view.LeftChild(nidx) ? view.RightChild(nidx) : view.LeftChild(nidx));
+    }
+  };
+  auto left1 = view.LeftChild(1), right1 = view.RightChild(1);
+  check({root}, {{10, 3}}, {2});      // The right child has fewer rows.
+  check({root}, {}, {1});             // The left child has less Hessian.
+  check({node1}, {{3, 3}}, {left1});  // Ties build the left child.
+  // Each candidate uses its own counts.
+  check({root, node1}, {{10, 3}, {2, 8}}, {2, left1});
+  check({root, node1}, {{3, 10}, {8, 2}}, {1, right1});
+  check({root, node1}, {}, {1, right1});
+  // The counts must cover every candidate.
+  std::vector<bst_node_t> build(1), sub(1);
+  EXPECT_THROW(AssignNodes(view, {root}, std::vector<ChildRows>{{10, 3}, {2, 8}}, build, sub),
+               dmlc::Error);
+}
+}  // namespace
+
+TEST(CPUHistogram, AssignNodes) {
+  auto p_tree = MakeTwoSplitTree();
+  TestAssignNodes(p_tree->HostScView(), 1);
+  bst_target_t constexpr kTargets = 3;
+  auto p_mt_tree = MakeTwoSplitTree(kTargets);
+  TestAssignNodes(p_mt_tree->HostMtView(), kTargets);
+}
+
+TEST(CPUHistogram, CountChildRows) {
+  // Two pages: in the first alone the root's right child has fewer rows, in the sum the left one.
+  struct Partition {
+    std::size_t n;
+    [[nodiscard]] std::size_t Size() const { return n; }
+  };
+  struct Partitioner {
+    std::vector<Partition> partitions;
+    [[nodiscard]] auto const &Partitions() const { return partitions; }
+  };
+  std::vector<Partitioner> partitioners{{{{8}, {7}, {1}, {4}, {3}}}, {{{9}, {0}, {9}, {0}, {0}}}};
+  std::vector<CPUExpandEntry> candidates{{0, 0}, {1, 1}};
+  std::vector<ChildRows> expected{{7, 10}, {4, 3}};
+  auto p_tree = MakeTwoSplitTree();
+  ASSERT_EQ(cpu_impl::CountChildRows(p_tree->HostScView(), partitioners, candidates), expected);
+  auto p_mt_tree = MakeTwoSplitTree(3);
+  ASSERT_EQ(cpu_impl::CountChildRows(p_mt_tree->HostMtView(), partitioners, candidates), expected);
+}
+
+namespace {
+// Three rows split two to one, and a constant second feature puts all of them in one bin. The two
+// rows on one side have a Hessian of 1 each, the lone row on the other side 2^60, so in the shared
+// bin the parent's sum 2 + 2^60 rounds to 2^60. Building the lone row's child, which has fewer
+// rows, makes the other child's bin 2^60 - 2^60 = 0, the rounding error that subtraction inherits;
+// building the child with less Hessian gives exactly 2. The distributed run gives every worker
+// all three rows, with gradients divided by the number of workers, and keeps the Hessian rule.
+void TestBuildChild(bool is_distributed, bool fewer_left) {
+  Context ctx;
+  float const lone = fewer_left ? 0.0f : 1.0f, pair = fewer_left ? 1.0f : 0.0f;
+  auto dmat = GetDMatrixFromData(
+      {fewer_left ? lone : pair, 0.0f, pair, 0.0f, fewer_left ? pair : lone, 0.0f}, 3, 2);
+  BatchParam batch{2, 0.5};
+  auto const &gmat = *dmat->GetBatches<GHistIndexMatrix>(&ctx, batch).begin();
+  HistMakerTrainParam hist_param;
+  float const big = std::ldexp(1.0f, 60);
+  auto world = static_cast<float>(collective::GetWorldSize());
+  // The lone row is row 0 when it goes left, row 2 otherwise.
+  std::vector<GradientPair> gpair(3, GradientPair{-1.0f / world, 1.0f / world});
+  gpair[fewer_left ? 0 : 2] = GradientPair{1.0f / world, big / world};
+  auto view = linalg::MakeTensorView(&ctx, common::Span<GradientPair const>{gpair}, 3, 1);
+
+  RegTree tree;
+  std::vector<CommonRowPartitioner> partitioners;
+  partitioners.emplace_back(&ctx, 3, 0);
+  MultiHistogramBuilder builder;
+  builder.Reset(&ctx, gmat.cut.TotalBins(), 1, batch, is_distributed, &hist_param);
+  CPUExpandEntry best{0, 0};
+  builder.BuildRootHist(dmat.get(), tree.HostScView(), partitioners, view, best, batch);
+
+  auto split_cond = gmat.cut.Values().front();
+  GradientPairPrecise few{1.0, big}, many{-2.0, 2.0};
+  auto const &left = fewer_left ? few : many;
+  auto const &right = fewer_left ? many : few;
+  best.split.Update(1.0f, 0, split_cond, false, false, linalg::MakeVec(&left, 1),
+                    linalg::MakeVec(&right, 1));
+  tree.Expand({{0, 0, split_cond, false},
+               {0.0, 2.0 + big},
+               {0.0, left.GetHess()},
+               {0.0, right.GetHess()},
+               1.0});
+  std::vector<CPUExpandEntry> candidates{best};
+  partitioners.front().UpdatePosition(&ctx, gmat, candidates, tree.HostScView());
+  bst_node_t const few_nidx = fewer_left ? 1 : 2, many_nidx = fewer_left ? 2 : 1;
+  ASSERT_EQ(partitioners.front().Partitions()[few_nidx].Size(), 1);
+  ASSERT_EQ(partitioners.front().Partitions()[many_nidx].Size(), 2);
+  builder.BuildHistLeftRight(&ctx, dmat.get(), tree.HostScView(), partitioners, candidates, view,
+                             batch);
+
+  auto const &hist = builder.Histogram(0);
+  auto shared_bin = gmat.cut.Ptrs()[1];  // The only bin of the second feature.
+  ASSERT_EQ(gmat.cut.Ptrs()[2] - shared_bin, 1);
+  ASSERT_EQ(hist[0][shared_bin].GetHess(), static_cast<double>(big));
+  ASSERT_EQ(hist[few_nidx][shared_bin].GetHess(), static_cast<double>(big));
+  // 0 is the rounding error, not the true sum of 2: it shows that the child with fewer rows was
+  // built and the other one subtracted.
+  ASSERT_EQ(hist[many_nidx][shared_bin].GetHess(), is_distributed ? 2.0 : 0.0);
+}
+}  // namespace
+
+TEST(CPUHistogram, BuildChildWithFewerRows) {
+  TestBuildChild(false, false);
+  TestBuildChild(false, true);
+}
+
+TEST(CPUHistogram, DistributedBuildChildWithLessHessian) {
+  collective::TestDistributedGlobal(2, [] {
+    TestBuildChild(true, false);
+    TestBuildChild(true, true);
   });
 }
 
