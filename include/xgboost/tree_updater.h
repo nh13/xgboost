@@ -73,6 +73,20 @@ class TreeUpdater : public Configurable {
   virtual void Update(tree::TrainParam const* param, GradientContainer* gpair, DMatrix* p_fmat,
                       common::Span<HostDeviceVector<bst_node_t>> out_position,
                       std::vector<RegTree*> const& out_trees) = 0;
+  /**
+   * @brief Whether copies of this updater, each with its own context, can build trees on p_fmat
+   *        at the same time, and if so, prepare p_fmat for them.
+   *
+   * Called on the calling thread before the copies start. The copies are created with this
+   * updater's name and loaded from its SaveConfig, so an updater that returns true must keep all
+   * of its configured state in that. It must also have built or synced any data of p_fmat that
+   * the copies would otherwise create or move lazily, so the copies only read p_fmat.
+   *
+   * @return Whether the copies can update trees on p_fmat at the same time.
+   */
+  [[nodiscard]] virtual bool PrepareConcurrentBuild(tree::TrainParam const*, DMatrix*) {
+    return false;
+  }
 
   [[nodiscard]] virtual char const* Name() const = 0;
 
