@@ -30,9 +30,14 @@ struct OpenMPExecutor {
       return 1;
     }
 #if defined(_MSC_VER)
-    // MSVC doesn't implement omp_get_thread_limit.
+    // MSVC implements OpenMP 2.0, which lacks omp_get_thread_limit and omp_get_max_active_levels.
     auto limit = std::numeric_limits<std::int32_t>::max();
 #else
+    // With no active parallel level allowed (OMP_MAX_ACTIVE_LEVELS=0), a region gets one thread,
+    // and Execute2d would fail its team-size check if more were requested.
+    if (omp_get_max_active_levels() < 1) {
+      return 1;
+    }
     auto limit = omp_get_thread_limit();
 #endif
     CHECK_GE(limit, 1) << "Invalid thread limit for OpenMP.";
@@ -104,7 +109,9 @@ struct OpenMPExecutor {
     exc.Rethrow();
   }
 
-  // Wrapper to implement nested parallelism with simple omp parallel for
+  // Split the blocks into one contiguous chunk per requested thread. The chunks assume a full
+  // team, so a smaller one (OMP_DYNAMIC, a thread limit, or a nested region with nesting off) is
+  // an error rather than a silent skip of the remaining chunks.
   template <typename Space, typename Func>
   static void Execute2d(Space const& space, std::int32_t n_threads, Func&& fn) {
     std::size_t n_blocks_in_space = space.Size();
@@ -118,6 +125,18 @@ struct OpenMPExecutor {
     {
       exc.Run([&]() {
         std::size_t tid = omp_get_thread_num();
+        auto team = omp_get_num_threads();
+        if (team != n_threads) {
+          // Every thread sees the same team size; one reports it and none runs a chunk.
+          if (tid == 0) {
+            LOG(FATAL) << "OpenMP started " << team << " of the " << n_threads
+                       << " requested threads. The work is split by the requested count, so a "
+                          "smaller team would skip part of it. OMP_DYNAMIC=true, a thread limit "
+                          "or a nested parallel region can cause this; turn them off, or set "
+                          "nthread=1.";
+          }
+          return;
+        }
         auto&& callback =
             detail::BindWorker(fn, [tid] { return Worker{static_cast<std::int32_t>(tid)}; });
         std::size_t chunck_size = n_blocks_in_space / n_threads + !!(n_blocks_in_space % n_threads);

@@ -1,7 +1,7 @@
 /**
  * Copyright 2019-2026, XGBoost Contributors
  */
-#include <dmlc/omp.h>  // for omp_get_thread_num, omp_get_max_threads, omp_set_num_threads
+#include <dmlc/omp.h>  // for omp_get_thread_num, omp_get_max_threads, omp_set_max_active_levels
 #include <gtest/gtest.h>
 
 #include <array>      // for array
@@ -10,10 +10,12 @@
 #include <cstddef>    // for size_t
 #include <memory>     // for make_shared, make_unique, shared_ptr
 #include <stdexcept>  // for runtime_error
+#include <string>     // for string
 #include <thread>     // for sleep_for, thread
 #include <vector>     // for vector
 
 #include "../../../src/common/threading_utils.h"  // BlockedSpace2d,ParallelFor2d,ParallelFor
+#include "../../../src/common/utils.h"            // for MakeCleanup
 #include "xgboost/global_config.h"                // for GlobalConfigThreadLocalStore
 
 namespace xgboost::common {
@@ -35,6 +37,41 @@ TEST(ParallelFor2d, CreateBlockedSpace2d) {
   }
 }
 
+TEST(ParallelFor2d, FewerThreadsThanRequested) {
+#if defined(_OPENMP) && !defined(_MSC_VER)
+  // With nesting off, a region inside another one starts one thread although four are requested.
+  // The blocks are split for a full team, so ParallelFor2d raises instead of skipping blocks.
+  auto const max_levels = omp_get_max_active_levels();
+  auto restore = MakeCleanup([&] { omp_set_max_active_levels(max_levels); });
+  omp_set_max_active_levels(1);
+  BlockedSpace2d space(7, [](std::size_t) { return std::size_t{1}; }, 1);
+  std::atomic<int> n_outer{0}, n_errors{0}, n_visits{0};
+  std::string message;
+#pragma omp parallel num_threads(2)
+  {
+#pragma omp single
+    n_outer = omp_get_num_threads();
+    try {
+      ParallelFor2d(space, 4, [&](std::size_t, Range1d) { ++n_visits; });
+    } catch (dmlc::Error const& e) {
+      if (++n_errors == 1) {
+        message = e.what();
+      }
+    }
+  }
+  if (n_outer < 2) {
+    GTEST_SKIP() << "OpenMP didn't start the outer team.";
+  }
+  EXPECT_EQ(n_errors.load(), 2);
+  EXPECT_EQ(n_visits.load(), 0);
+  EXPECT_NE(message.find("OpenMP started 1 of the 4 requested threads"), std::string::npos)
+      << message;
+  EXPECT_NE(message.find("nested parallel region"), std::string::npos) << message;
+#else
+  GTEST_SKIP() << "Needs OpenMP 3.0 (omp_set_max_active_levels), which MSVC lacks.";
+#endif
+}
+
 TEST(ParallelFor2d, Coverage) {
   std::vector<std::size_t> sizes{0, 1, 5, 8, 19};
   BlockedSpace2d space(sizes.size(), [&](auto i) { return sizes[i]; }, 3);
@@ -51,13 +88,32 @@ TEST(ParallelFor2d, Coverage) {
     if (n_threads == 1) {
       ParallelFor2d(space, n_threads, visit);
     } else {
-      ParallelFor2d(space, n_threads,
-                    WithWorker([&, limit = std::make_unique<int>(n_threads)](
-                                   std::size_t i, Range1d range, Worker worker) {
-                      ASSERT_GE(worker.Id(), 0);
-                      ASSERT_LT(worker.Id(), *limit);
-                      visit(i, range);
-                    }));
+      try {
+        ParallelFor2d(space, n_threads,
+                      WithWorker([&, limit = std::make_unique<int>(n_threads)](
+                                     std::size_t i, Range1d range, Worker worker) {
+                        ASSERT_GE(worker.Id(), 0);
+                        ASSERT_LT(worker.Id(), *limit);
+                        visit(i, range);
+                      }));
+      } catch (dmlc::Error const& e) {
+        // ParallelFor2d raises when OpenMP starts fewer threads (OMP_DYNAMIC, a thread limit);
+        // FewerThreadsThanRequested covers that. With a full team, or for any other error, it
+        // must not raise.
+#if defined(_OPENMP)
+        bool short_team = std::string(e.what()).find("requested threads") != std::string::npos;
+        int team = 0;
+#pragma omp parallel num_threads(n_threads)
+        {
+#pragma omp master
+          team = omp_get_num_threads();
+        }
+        if (short_team && (team < n_threads || omp_get_dynamic())) {
+          GTEST_SKIP() << "OpenMP didn't start a full team: " << e.what();
+        }
+#endif
+        FAIL() << e.what();
+      }
     }
     for (auto const& row : visits) {
       for (auto count : row) {
@@ -147,6 +203,31 @@ TEST(GetNumThreads, ConfiguredLimit) {
   omp_set_num_threads(previous);
 #else
   config->nthread = previous;
+#endif
+}
+
+TEST(GetNumThreads, NoActiveLevels) {
+#if defined(_OPENMP) && !defined(_MSC_VER)
+  // With no active parallel level allowed, every region runs on one thread, so XGBoost uses one
+  // thread instead of asking ParallelFor2d for a team it can't get.
+  if (GetNumThreads(0) < 2) {
+    GTEST_SKIP() << "Needs more than one thread.";
+  }
+  auto previous = omp_get_max_active_levels();
+  auto restore = MakeCleanup([&] { omp_set_max_active_levels(previous); });
+  omp_set_max_active_levels(0);
+  auto n_threads = GetNumThreads(0);
+  auto n_capped = GetNumThreads(8);
+  BlockedSpace2d space(3, [](std::size_t) { return std::size_t{1}; }, 1);
+  std::array<std::atomic<int>, 3> visits{};
+  ParallelFor2d(space, n_threads, [&](std::size_t i, Range1d) { ++visits[i]; });
+  EXPECT_EQ(n_threads, 1);
+  EXPECT_EQ(n_capped, 1);
+  for (auto const& count : visits) {
+    EXPECT_EQ(count.load(), 1);
+  }
+#else
+  GTEST_SKIP() << "Needs OpenMP 3.0 (omp_set_max_active_levels), which MSVC lacks.";
 #endif
 }
 
